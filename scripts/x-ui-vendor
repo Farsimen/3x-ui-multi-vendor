@@ -1,0 +1,248 @@
+#!/bin/bash
+
+# رنگ‌ها
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# مسیر دیتابیس
+DB_PATH="/etc/x-ui/x-ui.db"
+
+# توابع کمکی
+error() {
+    echo -e "${RED}ERROR: $1${NC}"
+    exit 1
+}
+
+success() {
+    echo -e "${GREEN}SUCCESS: $1${NC}"
+}
+
+info() {
+    echo -e "${YELLOW}INFO: $1${NC}"
+}
+
+# بررسی دسترسی root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error "این اسکریپت باید با دسترسی root اجرا شود"
+    fi
+}
+
+# بررسی وجود دیتابیس
+check_db() {
+    if [[ ! -f "$DB_PATH" ]]; then
+        error "دیتابیس 3X-UI یافت نشد: $DB_PATH"
+    fi
+}
+
+# Hash کردن password با bcrypt
+hash_password() {
+    local password="$1"
+    # استفاده از htpasswd برای bcrypt
+    if command -v htpasswd &> /dev/null; then
+        htpasswd -bnBC 10 "" "$password" | tr -d ':\n' | sed 's/^2y/2a/'
+    else
+        error "htpasswd نصب نیست. نصب کنید: apt-get install apache2-utils"
+    fi
+}
+
+# اضافه کردن vendor
+add_vendor() {
+    local username="$1"
+    local password="$2"
+    shift 2
+    local inbound_ids=("$@")
+    
+    if [[ -z "$username" || -z "$password" ]]; then
+        error "نام کاربری و رمز عبور الزامی است"
+    fi
+    
+    check_db
+    
+    # بررسی وجود نام کاربری
+    local exists=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM users WHERE username='$username';")
+    if [[ $exists -gt 0 ]]; then
+        error "کاربر با نام '$username' از قبل وجود دارد"
+    fi
+    
+    # Hash کردن password
+    info "در حال Hash کردن رمز عبور..."
+    local hashed_password=$(hash_password "$password")
+    
+    # ساخت کاربر
+    sqlite3 "$DB_PATH" "INSERT INTO users (username, password) VALUES ('$username', '$hashed_password');"
+    
+    # دریافت ID کاربر جدید
+    local user_id=$(sqlite3 "$DB_PATH" "SELECT id FROM users WHERE username='$username';")
+    
+    # ایجاد نقش vendor
+    sqlite3 "$DB_PATH" "INSERT INTO user_roles (user_id, role, created_at, updated_at) VALUES ($user_id, 'vendor', datetime('now'), datetime('now'));"
+    
+    # اضافه کردن دسترسی‌های inbound
+    for inbound_id in "${inbound_ids[@]}"; do
+        sqlite3 "$DB_PATH" "INSERT INTO inbound_access (user_id, inbound_id, granted_at, granted_by) VALUES ($user_id, $inbound_id, datetime('now'), 1);"
+    done
+    
+    success "Vendor '$username' با موفقیت ساخته شد (ID: $user_id)"
+    
+    if [[ ${#inbound_ids[@]} -gt 0 ]]; then
+        info "دسترسی به Inbound IDs: ${inbound_ids[*]}"
+    fi
+}
+
+# لیست vendor ها
+list_vendors() {
+    check_db
+    
+    echo "لیست Vendor ها:"
+    echo "------------------------"
+    
+    sqlite3 -header -column "$DB_PATH" "
+        SELECT 
+            u.id as 'ID',
+            u.username as 'Username',
+            GROUP_CONCAT(ia.inbound_id) as 'Inbound_IDs'
+        FROM users u
+        JOIN user_roles ur ON u.id = ur.user_id
+        LEFT JOIN inbound_access ia ON u.id = ia.user_id
+        WHERE ur.role = 'vendor'
+        GROUP BY u.id;
+    "
+}
+
+# حذف vendor
+delete_vendor() {
+    local username="$1"
+    
+    if [[ -z "$username" ]]; then
+        error "نام کاربری الزامی است"
+    fi
+    
+    check_db
+    
+    # دریافت ID کاربر
+    local user_id=$(sqlite3 "$DB_PATH" "SELECT u.id FROM users u JOIN user_roles ur ON u.id = ur.user_id WHERE u.username='$username' AND ur.role='vendor';")
+    
+    if [[ -z "$user_id" ]]; then
+        error "Vendor با نام '$username' یافت نشد"
+    fi
+    
+    # حذف دسترسی‌ها
+    sqlite3 "$DB_PATH" "DELETE FROM inbound_access WHERE user_id=$user_id;"
+    
+    # حذف نقش
+    sqlite3 "$DB_PATH" "DELETE FROM user_roles WHERE user_id=$user_id;"
+    
+    # حذف کاربر
+    sqlite3 "$DB_PATH" "DELETE FROM users WHERE id=$user_id;"
+    
+    success "Vendor '$username' با موفقیت حذف شد"
+}
+
+# دادن دسترسی
+grant_access() {
+    local username="$1"
+    local inbound_id="$2"
+    
+    if [[ -z "$username" || -z "$inbound_id" ]]; then
+        error "نام کاربری و Inbound ID الزامی است"
+    fi
+    
+    check_db
+    
+    # دریافت ID کاربر
+    local user_id=$(sqlite3 "$DB_PATH" "SELECT u.id FROM users u JOIN user_roles ur ON u.id = ur.user_id WHERE u.username='$username' AND ur.role='vendor';")
+    
+    if [[ -z "$user_id" ]]; then
+        error "Vendor با نام '$username' یافت نشد"
+    fi
+    
+    # بررسی وجود دسترسی قبلی
+    local exists=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM inbound_access WHERE user_id=$user_id AND inbound_id=$inbound_id;")
+    
+    if [[ $exists -gt 0 ]]; then
+        info "دسترسی از قبل وجود دارد"
+        exit 0
+    fi
+    
+    # اضافه کردن دسترسی
+    sqlite3 "$DB_PATH" "INSERT INTO inbound_access (user_id, inbound_id, granted_at, granted_by) VALUES ($user_id, $inbound_id, datetime('now'), 1);"
+    
+    success "دسترسی به Inbound $inbound_id برای '$username' داده شد"
+}
+
+# گرفتن دسترسی
+revoke_access() {
+    local username="$1"
+    local inbound_id="$2"
+    
+    if [[ -z "$username" || -z "$inbound_id" ]]; then
+        error "نام کاربری و Inbound ID الزامی است"
+    fi
+    
+    check_db
+    
+    # دریافت ID کاربر
+    local user_id=$(sqlite3 "$DB_PATH" "SELECT u.id FROM users u JOIN user_roles ur ON u.id = ur.user_id WHERE u.username='$username' AND ur.role='vendor';")
+    
+    if [[ -z "$user_id" ]]; then
+        error "Vendor با نام '$username' یافت نشد"
+    fi
+    
+    # حذف دسترسی
+    sqlite3 "$DB_PATH" "DELETE FROM inbound_access WHERE user_id=$user_id AND inbound_id=$inbound_id;"
+    
+    success "دسترسی به Inbound $inbound_id از '$username' گرفته شد"
+}
+
+# نمایش راهنما
+show_help() {
+    cat << EOF
+استفاده: x-ui-vendor <command> [arguments]
+
+دستورات:
+  add <username> <password> [inbound_ids...]  - ساخت vendor جدید
+  list                                         - لیست تمام vendor ها
+  delete <username>                            - حذف vendor
+  grant <username> <inbound_id>                - دادن دسترسی به inbound
+  revoke <username> <inbound_id>               - گرفتن دسترسی از inbound
+  help                                         - نمایش این راهنما
+
+مثال‌ها:
+  x-ui-vendor add vendor1 password123 1 2 3
+  x-ui-vendor list
+  x-ui-vendor delete vendor1
+  x-ui-vendor grant vendor1 4
+  x-ui-vendor revoke vendor1 2
+EOF
+}
+
+# Main
+check_root
+
+case "$1" in
+    add)
+        shift
+        add_vendor "$@"
+        ;;
+    list)
+        list_vendors
+        ;;
+    delete)
+        delete_vendor "$2"
+        ;;
+    grant)
+        grant_access "$2" "$3"
+        ;;
+    revoke)
+        revoke_access "$2" "$3"
+        ;;
+    help|--help|-h)
+        show_help
+        ;;
+    *)
+        error "دستور نامعتبر. از 'x-ui-vendor help' برای راهنما استفاده کنید"
+        ;;
+esac
