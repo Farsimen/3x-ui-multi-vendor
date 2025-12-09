@@ -13,12 +13,16 @@ $vendorId = $_SESSION['vendor_id'];
 $vendorRole = $_SESSION['vendor_role'];
 
 function getDB() {
-    static $db = null;
-    if ($db === null) {
+    try {
         $db = new PDO('sqlite:' . DB_PATH);
         $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $db->exec('PRAGMA journal_mode=WAL;');
+        $db->exec('PRAGMA busy_timeout=5000;');
+        return $db;
+    } catch (Exception $e) {
+        error_log('DB Error: ' . $e->getMessage());
+        throw $e;
     }
-    return $db;
 }
 
 function checkAccess($vendorId, $inboundId, $role) {
@@ -30,8 +34,8 @@ function checkAccess($vendorId, $inboundId, $role) {
 }
 
 function restartXUI() {
-    exec('systemctl restart x-ui 2>&1', $output, $return);
-    return $return === 0;
+    exec('systemctl restart x-ui > /dev/null 2>&1 &');
+    return true;
 }
 
 try {
@@ -41,8 +45,12 @@ try {
         case 'add_client':
             $inboundId = intval($_POST['inbound_id']);
             $email = trim($_POST['email']);
-            $totalGB = floatval($_POST['total_gb']) * 1073741824; // GB to bytes
+            $totalGB = floatval($_POST['total_gb']) * 1073741824;
             $expiryDays = intval($_POST['expiry_days']);
+            
+            if (empty($email)) {
+                throw new Exception('ایمیل نمی‌تواند خالی باشد');
+            }
             
             if (!checkAccess($vendorId, $inboundId, $vendorRole)) {
                 throw new Exception('دسترسی مجاز نیست');
@@ -66,37 +74,62 @@ try {
                 mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff)
             );
             
-            $subId = substr(md5(uniqid($email, true)), 0, 16);
+            $subId = bin2hex(random_bytes(8));
+            $timestamp = time() * 1000;
             
             $newClient = [
                 'id' => $uuid,
-                'alterId' => 0,
                 'email' => $email,
+                'enable' => true,
                 'limitIp' => 0,
                 'totalGB' => intval($totalGB),
                 'expiryTime' => $expiryDays > 0 ? (time() + $expiryDays * 86400) * 1000 : 0,
-                'enable' => true,
                 'tgId' => '',
                 'subId' => $subId,
-                'reset' => 0
+                'reset' => 0,
+                'created_at' => $timestamp,
+                'updated_at' => $timestamp
             ];
             
-            if (in_array($inbound['protocol'], ['vless', 'vmess'])) {
+            // Protocol specific fields
+            if ($inbound['protocol'] === 'vless') {
                 $newClient['flow'] = '';
+                $newClient['security'] = '';
+                $newClient['password'] = '';
+            } elseif ($inbound['protocol'] === 'vmess') {
+                $newClient['alterId'] = 0;
+            } elseif ($inbound['protocol'] === 'trojan') {
+                $newClient['password'] = bin2hex(random_bytes(16));
             }
             
             $settings = json_decode($inbound['settings'], true);
             if (!isset($settings['clients'])) {
                 $settings['clients'] = [];
             }
+            
+            // Check duplicate email
+            foreach ($settings['clients'] as $existingClient) {
+                if ($existingClient['email'] === $email) {
+                    throw new Exception('این ایمیل قبلاً استفاده شده است');
+                }
+            }
+            
             $settings['clients'][] = $newClient;
             
             $stmt = $db->prepare('UPDATE inbounds SET settings = ? WHERE id = ?');
-            $stmt->execute([json_encode($settings), $inboundId]);
+            $success = $stmt->execute([json_encode($settings, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), $inboundId]);
+            
+            if (!$success) {
+                throw new Exception('خطا در ذخیره اطلاعات');
+            }
             
             restartXUI();
             
-            echo json_encode(['success' => true, 'message' => 'کاربر با موفقیت ایجاد شد']);
+            echo json_encode([
+                'success' => true, 
+                'message' => 'کاربر با موفقیت ایجاد شد',
+                'client' => $newClient
+            ]);
             break;
             
         case 'toggle_client':
@@ -114,15 +147,22 @@ try {
             $inbound = $stmt->fetch(PDO::FETCH_ASSOC);
             
             $settings = json_decode($inbound['settings'], true);
+            $found = false;
             foreach ($settings['clients'] as &$client) {
                 if ($client['id'] === $clientId || $client['email'] === $clientId) {
                     $client['enable'] = $enable;
+                    $client['updated_at'] = time() * 1000;
+                    $found = true;
                     break;
                 }
             }
             
+            if (!$found) {
+                throw new Exception('کاربر یافت نشد');
+            }
+            
             $stmt = $db->prepare('UPDATE inbounds SET settings = ? WHERE id = ?');
-            $stmt->execute([json_encode($settings), $inboundId]);
+            $stmt->execute([json_encode($settings, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), $inboundId]);
             
             restartXUI();
             
@@ -145,18 +185,27 @@ try {
             $inbound = $stmt->fetch(PDO::FETCH_ASSOC);
             
             $settings = json_decode($inbound['settings'], true);
+            $found = false;
             foreach ($settings['clients'] as &$client) {
                 if ($client['id'] === $clientId || $client['email'] === $clientId) {
                     $client['totalGB'] = intval($totalGB);
                     if ($expiryDays > 0) {
                         $client['expiryTime'] = (time() + $expiryDays * 86400) * 1000;
+                    } else {
+                        $client['expiryTime'] = 0;
                     }
+                    $client['updated_at'] = time() * 1000;
+                    $found = true;
                     break;
                 }
             }
             
+            if (!$found) {
+                throw new Exception('کاربر یافت نشد');
+            }
+            
             $stmt = $db->prepare('UPDATE inbounds SET settings = ? WHERE id = ?');
-            $stmt->execute([json_encode($settings), $inboundId]);
+            $stmt->execute([json_encode($settings, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), $inboundId]);
             
             restartXUI();
             
@@ -167,6 +216,7 @@ try {
             throw new Exception('عملیات نامعتبر');
     }
 } catch (Exception $e) {
+    error_log('API Error: ' . $e->getMessage());
     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
 }
 ?>
